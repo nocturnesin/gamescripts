@@ -1,3 +1,4 @@
+-- Services
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -11,6 +12,13 @@ local SellUnit = RemoteFunctions:FindFirstChild("SellUnit")
 local PlaceDifficultyVote = RemoteFunctions:FindFirstChild("PlaceDifficultyVote")
 local StartDifficultyVote = (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("StartDifficultyVote")) or ReplicatedStorage:FindFirstChild("StartDifficultyVote")
 local SetUnitEquipped = RemoteFunctions:FindFirstChild("SetUnitEquipped")
+
+-- Debug remote availability
+print("Remote availability:")
+print("PlaceUnit:", PlaceUnit and "Found" or "Not found")
+print("SellUnit:", SellUnit and "Found" or "Not found")
+print("PlaceDifficultyVote:", PlaceDifficultyVote and "Found" or "Not found")
+print("SetUnitEquipped:", SetUnitEquipped and "Found" or "Not found")
 
 local recordingsFolder = "recordings"
 local recording = false
@@ -279,7 +287,13 @@ local function scanUnits()
     return out
 end
 
--- Load Rayfield library
+-- Enable Secure Mode for Wave
+getgenv().SecureMode = true
+
+-- Debugging: Log script start
+print("Starting script in Wave...")
+
+-- Load Rayfield
 local Rayfield
 local ok, err = pcall(function()
     Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
@@ -297,287 +311,502 @@ if not ok or not Rayfield then
                 CreateToggle = function() end
             } end
         },
-        Notify = function(args) warn(args.Title..": "..args.Content) end,
+        Notify = function(args) print(args.Title..": "..args.Content) end,
         LoadConfiguration = function() end
     }
 end
 
--- Debugging: Log UI initialization
-print("Initializing Rayfield UI...")
+-- Validate Rayfield methods
+local requiredMethods = {"CreateWindow", "Notify", "LoadConfiguration"}
+local missingMethods = {}
+for _, method in ipairs(requiredMethods) do
+    if not Rayfield[method] then
+        table.insert(missingMethods, method)
+    end
+end
+if #missingMethods > 0 then
+    warn("Rayfield missing methods: "..table.concat(missingMethods, ", "))
+end
 
-local Window = Rayfield:CreateWindow({
-    Name = "Recorder",
-    LoadingTitle = "Recorder",
-    LoadingSubtitle = "Ready",
-    ConfigurationSaving = {Enabled = true, FolderName = nil, FileName = "recorder_config"},
-    ToggleUIKeybind = "K" -- Added keybind to toggle UI visibility
-})
+-- Create UI only if CreateWindow is available
+local Window
+if Rayfield.CreateWindow then
+    print("Initializing Rayfield UI...")
+    Window = Rayfield:CreateWindow({
+        Name = "Recorder",
+        LoadingTitle = "Recorder",
+        LoadingSubtitle = "Ready",
+        ConfigurationSaving = {Enabled = true, FolderName = nil, FileName = "recorder_config"},
+        ToggleUIKeybind = "K"
+    })
+    print("Rayfield UI initialized successfully")
+else
+    warn("Cannot create UI: Rayfield.CreateWindow is nil")
+    return -- Exit script if UI cannot be created
+end
+
+-- Notify user of UI toggle
+if Rayfield.Notify then
+    Rayfield:Notify({
+        Title = "UI Loaded",
+        Content = "Press 'K' to toggle the UI if it doesn't appear",
+        Duration = 5
+    })
+else
+    print("UI Loaded: Press 'K' to toggle the UI if it doesn't appear")
+end
 
 -- Recorder Tab
-local recTab = Window:CreateTab("Recorder")
-local recSection = recTab:CreateSection("Record Controls")
-recTab:CreateButton({
-    Name = "Start Recording",
-    Callback = function()
-        currentRecording = {}
-        recording = true
-        Rayfield:Notify({Title = "Recording", Content = "Started recording", Duration = 3})
+local recTab
+if Window.CreateTab then
+    recTab = Window:CreateTab("Recorder")
+else
+    warn("Cannot create Recorder tab: CreateTab is nil")
+end
+if recTab and recTab.CreateSection then
+    local recSection = recTab:CreateSection("Record Controls")
+    if recTab.CreateButton then
+        recTab:CreateButton({
+            Name = "Start Recording",
+            Callback = function()
+                currentRecording = {}
+                recording = true
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = "Recording", Content = "Started recording", Duration = 3})
+                else
+                    print("Recording: Started recording")
+                end
+            end
+        })
+        recTab:CreateButton({
+            Name = "Stop Recording",
+            Callback = function()
+                recording = false
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = "Recording", Content = "Stopped recording", Duration = 3})
+                else
+                    print("Recording: Stopped recording")
+                end
+            end
+        })
     end
-})
-recTab:CreateButton({
-    Name = "Stop Recording",
-    Callback = function()
-        recording = false
-        Rayfield:Notify({Title = "Recording", Content = "Stopped recording", Duration = 3})
+    if recTab.CreateInput then
+        local saveNameInput = recTab:CreateInput({
+            Name = "Filename",
+            PlaceholderText = "session_name",
+            RemoveTextAfterFocus = false,
+            Callback = function() end
+        })
+        if recTab.CreateButton then
+            recTab:CreateButton({
+                Name = "Save",
+                Callback = function()
+                    local name = tostring(saveNameInput.Value ~= "" and saveNameInput.Value or ("rec_"..os.time()))
+                    local ok, e = saveRecording(name, currentRecording)
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = ok and "Saved" or "Save Failed", Content = ok and name or tostring(e), Duration = 4})
+                    else
+                        print((ok and "Saved" or "Save Failed")..": "..(ok and name or tostring(e)))
+                    end
+                end
+            })
+        end
     end
-})
-local saveNameInput = recTab:CreateInput({
-    Name = "Filename",
-    PlaceholderText = "session_name",
-    RemoveTextAfterFocus = false,
-    Callback = function() end
-})
-recTab:CreateButton({
-    Name = "Save",
-    Callback = function()
-        local name = tostring(saveNameInput.Value ~= "" and saveNameInput.Value or ("rec_"..os.time()))
-        local ok, e = saveRecording(name, currentRecording)
-        Rayfield:Notify({Title = ok and "Saved" or "Save Failed", Content = ok and name or tostring(e), Duration = 4})
+    local recViewSection = recTab:CreateSection("Live")
+    if recTab.CreateButton then
+        recTab:CreateButton({
+            Name = "Show Current Length",
+            Callback = function()
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = "Recording", Content = tostring(#currentRecording).." actions", Duration = 3})
+                else
+                    print("Recording: "..tostring(#currentRecording).." actions")
+                end
+            end
+        })
+        recTab:CreateButton({
+            Name = "Clear Current",
+            Callback = function()
+                currentRecording = {}
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = "Cleared", Content = "Current recording cleared", Duration = 3})
+                else
+                    print("Cleared: Current recording cleared")
+                end
+            end
+        })
     end
-})
-
-local recViewSection = recTab:CreateSection("Live")
-recTab:CreateButton({
-    Name = "Show Current Length",
-    Callback = function()
-        Rayfield:Notify({Title = "Recording", Content = tostring(#currentRecording).." actions", Duration = 3})
-    end
-})
-recTab:CreateButton({
-    Name = "Clear Current",
-    Callback = function()
-        currentRecording = {}
-        Rayfield:Notify({Title = "Cleared", Content = "Current recording cleared", Duration = 3})
-    end
-})
+end
 
 -- Replayer Tab
-local replayTab = Window:CreateTab("Replayer")
-local replaySection = replayTab:CreateSection("Files & Playback")
-local files = listRecordings()
-local filesDropdown = replayTab:CreateDropdown({
-    Name = "Recordings",
-    Options = files,
-    MultiSelection = false,
-    Callback = function() end
-})
-replayTab:CreateButton({
-    Name = "Refresh",
-    Callback = function()
-        local newFiles = listRecordings()
-        filesDropdown:Refresh(newFiles)
-        Rayfield:Notify({Title = "Refreshed", Content = "Loaded "..#newFiles.." recordings", Duration = 3})
+local replayTab
+if Window.CreateTab then
+    replayTab = Window:CreateTab("Replayer")
+else
+    warn("Cannot create Replayer tab: CreateTab is nil")
+end
+if replayTab and replayTab.CreateSection then
+    local replaySection = replayTab:CreateSection("Files & Playback")
+    local files = listRecordings()
+    local filesDropdown
+    if replayTab.CreateDropdown then
+        filesDropdown = replayTab:CreateDropdown({
+            Name = "Recordings",
+            Options = files,
+            MultiSelection = false,
+            Callback = function() end
+        })
     end
-})
-replayTab:CreateButton({
-    Name = "Load Selected",
-    Callback = function()
-        local sel = filesDropdown.Value
-        if type(sel) == "table" then sel = sel[1] end
-        if not sel or sel == "" then
-            Rayfield:Notify({Title = "No File", Content = "Select a file to load", Duration = 3})
-            return
-        end
-        local data, e = loadRecording(sel)
-        if data then
-            currentRecording = data
-            Rayfield:Notify({Title = "Loaded", Content = sel, Duration = 3})
-        else
-            Rayfield:Notify({Title = "Load Failed", Content = tostring(e), Duration = 4})
-        end
+    if replayTab.CreateButton then
+        replayTab:CreateButton({
+            Name = "Refresh",
+            Callback = function()
+                local newFiles = listRecordings()
+                if filesDropdown and filesDropdown.Refresh then
+                    filesDropdown:Refresh(newFiles)
+                end
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = "Refreshed", Content = "Loaded "..#newFiles.." recordings", Duration = 3})
+                else
+                    print("Refreshed: Loaded "..#newFiles.." recordings")
+                end
+            end
+        })
+        replayTab:CreateButton({
+            Name = "Load Selected",
+            Callback = function()
+                local sel = filesDropdown and filesDropdown.Value
+                if type(sel) == "table" then sel = sel[1] end
+                if not sel or sel == "" then
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "No File", Content = "Select a file to load", Duration = 3})
+                    else
+                        print("No File: Select a file to load")
+                    end
+                    return
+                end
+                local data, e = loadRecording(sel)
+                if data then
+                    currentRecording = data
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Loaded", Content = sel, Duration = 3})
+                    else
+                        print("Loaded: "..sel)
+                    end
+                else
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Load Failed", Content = tostring(e), Duration = 4})
+                    else
+                        print("Load Failed: "..tostring(e))
+                    end
+                end
+            end
+        })
+        replayTab:CreateButton({
+            Name = "Start Replay",
+            Callback = function()
+                if #currentRecording == 0 then
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "No Data", Content = "Load or record first", Duration = 3})
+                    else
+                        print("No Data: Load or record first")
+                    end
+                    return
+                end
+                local ok, err = startReplay(currentRecording, {Speed = replayOptions.Speed, Loop = replayOptions.Loop, StartWaveOffset = replayOptions.StartWaveOffset})
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = ok and "Replay Started" or "Replay Failed", Content = ok and "Playing "..#currentRecording.." actions" or tostring(err), Duration = 4})
+                else
+                    print((ok and "Replay Started" or "Replay Failed")..": "..(ok and "Playing "..#currentRecording.." actions" or tostring(err)))
+                end
+            end
+        })
+        replayTab:CreateButton({
+            Name = "Stop Replay",
+            Callback = function()
+                stopReplay()
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = "Stopped", Content = "Replay stopped", Duration = 3})
+                else
+                    print("Stopped: Replay stopped")
+                end
+            end
+        })
     end
-})
-replayTab:CreateButton({
-    Name = "Start Replay",
-    Callback = function()
-        if #currentRecording == 0 then
-            Rayfield:Notify({Title = "No Data", Content = "Load or record first", Duration = 3})
-            return
-        end
-        local ok, err = startReplay(currentRecording, {Speed = replayOptions.Speed, Loop = replayOptions.Loop, StartWaveOffset = replayOptions.StartWaveOffset})
-        Rayfield:Notify({Title = ok and "Replay Started" or "Replay Failed", Content = ok and "Playing "..#currentRecording.." actions" or tostring(err), Duration = 4})
+    if replayTab.CreateSlider then
+        replayTab:CreateSlider({
+            Name = "Speed",
+            Range = {0.2, 4},
+            Increment = 0.1,
+            Suffix = "x",
+            CurrentValue = 1,
+            Callback = function(v)
+                replayOptions.Speed = v
+            end
+        })
     end
-})
-replayTab:CreateButton({
-    Name = "Stop Replay",
-    Callback = function()
-        stopReplay()
-        Rayfield:Notify({Title = "Stopped", Content = "Replay stopped", Duration = 3})
+    if replayTab.CreateToggle then
+        replayTab:CreateToggle({
+            Name = "Loop",
+            CurrentValue = false,
+            Callback = function(v)
+                replayOptions.Loop = v
+            end
+        })
     end
-})
-replayTab:CreateSlider({
-    Name = "Speed",
-    Range = {0.2, 4},
-    Increment = 0.1,
-    Suffix = "x",
-    CurrentValue = 1,
-    Callback = function(v)
-        replayOptions.Speed = v
+    if replayTab.CreateInput then
+        replayTab:CreateInput({
+            Name = "Start Wave Offset",
+            PlaceholderText = "0",
+            RemoveTextAfterFocus = false,
+            Callback = function(v)
+                replayOptions.StartWaveOffset = tonumber(v) or 0
+            end
+        })
     end
-})
-replayTab:CreateToggle({
-    Name = "Loop",
-    CurrentValue = false,
-    Callback = function(v)
-        replayOptions.Loop = v
-    end
-})
-replayTab:CreateInput({
-    Name = "Start Wave Offset",
-    PlaceholderText = "0",
-    RemoveTextAfterFocus = false,
-    Callback = function(v)
-        replayOptions.StartWaveOffset = tonumber(v) or 0
-    end
-})
+end
 
 -- Tools Tab
-local toolsTab = Window:CreateTab("Tools")
-local toolsSection = toolsTab:CreateSection("Scans & Vote")
-toolsTab:CreateButton({
-    Name = "Scan Hotbar",
-    Callback = function()
-        local h, err = scanHotbar()
-        local s = ""
-        for _, v in ipairs(h) do s = s..v.Index..": "..(v.Name or "nil").."\n" end
-        Rayfield:Notify({Title = "Hotbar", Content = s ~= "" and s or (err or "Empty hotbar"), Duration = 6})
+local toolsTab
+if Window.CreateTab then
+    toolsTab = Window:CreateTab("Tools")
+else
+    warn("Cannot create Tools tab: CreateTab is nil")
+end
+if toolsTab and toolsTab.CreateSection then
+    local toolsSection = toolsTab:CreateSection("Scans & Vote")
+    if toolsTab.CreateButton then
+        toolsTab:CreateButton({
+            Name = "Scan Hotbar",
+            Callback = function()
+                local h, err = scanHotbar()
+                local s = ""
+                for _, v in ipairs(h) do s = s..v.Index..": "..(v.Name or "nil").."\n" end
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = "Hotbar", Content = s ~= "" and s or (err or "Empty hotbar"), Duration = 6})
+                else
+                    print("Hotbar: "..(s ~= "" and s or (err or "Empty hotbar")))
+                end
+            end
+        })
+        toolsTab:CreateButton({
+            Name = "Scan Units Folder",
+            Callback = function()
+                local u, err = scanUnits()
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = "Units", Content = u and ("Found "..#u.." units") or (err or "No units found"), Duration = 4})
+                else
+                    print("Units: "..(u and ("Found "..#u.." units") or (err or "No units found")))
+                end
+            end
+        })
     end
-})
-toolsTab:CreateButton({
-    Name = "Scan Units Folder",
-    Callback = function()
-        local u, err = scanUnits()
-        Rayfield:Notify({Title = "Units", Content = u and ("Found "..#u.." units") or (err or "No units found"), Duration = 4})
+    if toolsTab.CreateToggle then
+        toolsTab:CreateToggle({
+            Name = "Auto Vote",
+            CurrentValue = false,
+            Callback = function(v)
+                autoVote = v
+            end
+        })
     end
-})
-toolsTab:CreateToggle({
-    Name = "Auto Vote",
-    CurrentValue = false,
-    Callback = function(v)
-        autoVote = v
+    if toolsTab.CreateDropdown then
+        toolsTab:CreateDropdown({
+            Name = "Difficulty",
+            Options = {"dif_normal", "dif_hard", "dif_insane"},
+            MultiSelection = false,
+            Callback = function(v)
+                autoVoteChoice = type(v) == "table" and v[1] or v
+            end
+        })
     end
-})
-toolsTab:CreateDropdown({
-    Name = "Difficulty",
-    Options = {"dif_normal", "dif_hard", "dif_insane"},
-    MultiSelection = false,
-    Callback = function(v)
-        autoVoteChoice = type(v) == "table" and v[1] or v
+    if toolsTab.CreateButton then
+        toolsTab:CreateButton({
+            Name = "Send Vote Now",
+            Callback = function()
+                if not PlaceDifficultyVote or not PlaceDifficultyVote.InvokeServer then
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Vote Failed", Content = "PlaceDifficultyVote unavailable", Duration = 3})
+                    else
+                        print("Vote Failed: PlaceDifficultyVote unavailable")
+                    end
+                    return
+                end
+                local diff = autoVoteChoice or "dif_normal"
+                local ok, err = pcall(PlaceDifficultyVote.InvokeServer, PlaceDifficultyVote, diff)
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = ok and "Vote Sent" or "Vote Failed", Content = ok and ("Voted for "..diff) or tostring(err), Duration = 3})
+                else
+                    print((ok and "Vote Sent" or "Vote Failed")..": "..(ok and ("Voted for "..diff) or tostring(err)))
+                end
+            end
+        })
     end
-})
-toolsTab:CreateButton({
-    Name = "Send Vote Now",
-    Callback = function()
-        if not PlaceDifficultyVote or not PlaceDifficultyVote.InvokeServer then
-            Rayfield:Notify({Title = "Vote Failed", Content = "PlaceDifficultyVote unavailable", Duration = 3})
-            return
-        end
-        local diff = autoVoteChoice or "dif_normal"
-        local ok, err = pcall(PlaceDifficultyVote.InvokeServer, PlaceDifficultyVote, diff)
-        Rayfield:Notify({Title = ok and "Vote Sent" or "Vote Failed", Content = ok and ("Voted for "..diff) or tostring(err), Duration = 3})
-    end
-})
+end
 
 -- Lobby Tab
-local lobbyTab = Window:CreateTab("Lobby")
-local lobbySection = lobbyTab:CreateSection("Unit Equipment")
-local unitInput = lobbyTab:CreateInput({
-    Name = "Unit Name",
-    PlaceholderText = "e.g., unique_1",
-    RemoveTextAfterFocus = false,
-    Callback = function() end
-})
-lobbyTab:CreateButton({
-    Name = "Equip Unit",
-    Callback = function()
-        if not SetUnitEquipped or not SetUnitEquipped.InvokeServer then
-            Rayfield:Notify({Title = "Equip Failed", Content = "SetUnitEquipped remote unavailable", Duration = 3})
-            return
-        end
-        local unitName = unitInput.Value
-        if not unitName or unitName == "" then
-            Rayfield:Notify({Title = "Equip Failed", Content = "Enter a unit name", Duration = 3})
-            return
-        end
-        local ok, err = pcall(SetUnitEquipped.InvokeServer, SetUnitEquipped, unitName, true)
-        Rayfield:Notify({Title = ok and "Equipped" or "Equip Failed", Content = ok and ("Equipped "..unitName) or tostring(err), Duration = 3})
+local lobbyTab
+if Window.CreateTab then
+    lobbyTab = Window:CreateTab("Lobby")
+else
+    warn("Cannot create Lobby tab: CreateTab is nil")
+end
+if lobbyTab and lobbyTab.CreateSection then
+    local lobbySection = lobbyTab:CreateSection("Unit Equipment")
+    local unitInput
+    if lobbyTab.CreateInput then
+        unitInput = lobbyTab:CreateInput({
+            Name = "Unit Name",
+            PlaceholderText = "e.g., unique_1",
+            RemoveTextAfterFocus = false,
+            Callback = function() end
+        })
     end
-})
-lobbyTab:CreateButton({
-    Name = "Unequip Unit",
-    Callback = function()
-        if not SetUnitEquipped or not SetUnitEquipped.InvokeServer then
-            Rayfield:Notify({Title = "Unequip Failed", Content = "SetUnitEquipped remote unavailable", Duration = 3})
-            return
-        end
-        local unitName = unitInput.Value
-        if not unitName or unitName == "" then
-            Rayfield:Notify({Title = "Unequip Failed", Content = "Enter a unit name", Duration = 3})
-            return
-        end
-        local ok, err = pcall(SetUnitEquipped.InvokeServer, SetUnitEquipped, unitName, false)
-        Rayfield:Notify({Title = ok and "Unequipped" or "Unequip Failed", Content = ok and ("Unequipped "..unitName) or tostring(err), Duration = 3})
+    if lobbyTab.CreateButton then
+        lobbyTab:CreateButton({
+            Name = "Equip Unit",
+            Callback = function()
+                if not SetUnitEquipped or not SetUnitEquipped.InvokeServer then
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Equip Failed", Content = "SetUnitEquipped remote unavailable", Duration = 3})
+                    else
+                        print("Equip Failed: SetUnitEquipped remote unavailable")
+                    end
+                    return
+                end
+                local unitName = unitInput and unitInput.Value or ""
+                if not unitName or unitName == "" then
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Equip Failed", Content = "Enter a unit name", Duration = 3})
+                    else
+                        print("Equip Failed: Enter a unit name")
+                    end
+                    return
+                end
+                local ok, err = pcall(SetUnitEquipped.InvokeServer, SetUnitEquipped, unitName, true)
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = ok and "Equipped" or "Equip Failed", Content = ok and ("Equipped "..unitName) or tostring(err), Duration = 3})
+                else
+                    print((ok and "Equipped" or "Equip Failed")..": "..(ok and ("Equipped "..unitName) or tostring(err)))
+                end
+            end
+        })
+        lobbyTab:CreateButton({
+            Name = "Unequip Unit",
+            Callback = function()
+                if not SetUnitEquipped or not SetUnitEquipped.InvokeServer then
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Unequip Failed", Content = "SetUnitEquipped remote unavailable", Duration = 3})
+                    else
+                        print("Unequip Failed: SetUnitEquipped remote unavailable")
+                    end
+                    return
+                end
+                local unitName = unitInput and unitInput.Value or ""
+                if not unitName or unitName == "" then
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Unequip Failed", Content = "Enter a unit name", Duration = 3})
+                    else
+                        print("Unequip Failed: Enter a unit name")
+                    end
+                    return
+                end
+                local ok, err = pcall(SetUnitEquipped.InvokeServer, SetUnitEquipped, unitName, false)
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = ok and "Unequipped" or "Unequip Failed", Content = ok and ("Unequipped "..unitName) or tostring(err), Duration = 3})
+                else
+                    print((ok and "Unequipped" or "Unequip Failed")..": "..(ok and ("Unequipped "..unitName) or tostring(err)))
+                end
+            end
+        })
     end
-})
+end
 
 -- Misc Tab
-local miscTab = Window:CreateTab("Misc")
-local miscSection = miscTab:CreateSection("Options")
-miscTab:CreateButton({
-    Name = "Current Wave",
-    Callback = function()
-        updateWaveCache()
-        Rayfield:Notify({Title = "Wave", Content = tostring(waveCache.Current).."/"..tostring(waveCache.Max), Duration = 3})
+local miscTab
+if Window.CreateTab then
+    miscTab = Window:CreateTab("Misc")
+else
+    warn("Cannot create Misc tab: CreateTab is nil")
+end
+if miscTab and miscTab.CreateSection then
+    local miscSection = miscTab:CreateSection("Options")
+    if miscTab.CreateButton then
+        miscTab:CreateButton({
+            Name = "Current Wave",
+            Callback = function()
+                updateWaveCache()
+                if Rayfield.Notify then
+                    Rayfield:Notify({Title = "Wave", Content = tostring(waveCache.Current).."/"..tostring(waveCache.Max), Duration = 3})
+                else
+                    print("Wave: "..tostring(waveCache.Current).."/"..tostring(waveCache.Max))
+                end
+            end
+        })
+        miscTab:CreateButton({
+            Name = "Export Current (clipboard)",
+            Callback = function()
+                local ok, enc = pcall(HttpService.JSONEncode, HttpService, currentRecording)
+                if ok and setclipboard then
+                    setclipboard(enc)
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Exported", Content = "Copied to clipboard", Duration = 3})
+                    else
+                        print("Exported: Copied to clipboard")
+                    end
+                else
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Export Failed", Content = tostring(enc or "No setclipboard"), Duration = 3})
+                    else
+                        print("Export Failed: "..tostring(enc or "No setclipboard"))
+                    end
+                end
+            end
+        })
+        miscTab:CreateButton({
+            Name = "Import from Clipboard",
+            Callback = function()
+                if not getclipboard then
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "No Clipboard", Content = "getclipboard unavailable", Duration = 3})
+                    else
+                        print("No Clipboard: getclipboard unavailable")
+                    end
+                    return
+                end
+                local str = getclipboard()
+                local ok, dec = pcall(HttpService.JSONDecode, HttpService, str)
+                if ok and type(dec) == "table" then
+                    currentRecording = dec
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Imported", Content = "Recording loaded", Duration = 3})
+                    else
+                        print("Imported: Recording loaded")
+                    end
+                else
+                    if Rayfield.Notify then
+                        Rayfield:Notify({Title = "Import Failed", Content = "Invalid JSON: "..tostring(dec), Duration = 3})
+                    else
+                        print("Import Failed: Invalid JSON: "..tostring(dec))
+                    end
+                end
+            end
+        })
     end
-})
-miscTab:CreateButton({
-    Name = "Export Current (clipboard)",
-    Callback = function()
-        local ok, enc = pcall(HttpService.JSONEncode, HttpService, currentRecording)
-        if ok and setclipboard then
-            setclipboard(enc)
-            Rayfield:Notify({Title = "Exported", Content = "Copied to clipboard", Duration = 3})
-        else
-            Rayfield:Notify({Title = "Export Failed", Content = tostring(enc or "No setclipboard"), Duration = 3})
-        end
-    end
-})
-miscTab:CreateButton({
-    Name = "Import from Clipboard",
-    Callback = function()
-        if not getclipboard then
-            Rayfield:Notify({Title = "No Clipboard", Content = "getclipboard unavailable", Duration = 3})
-            return
-        end
-        local str = getclipboard()
-        local ok, dec = pcall(HttpService.JSONDecode, HttpService, str)
-        if ok and type(dec) == "table" then
-            currentRecording = dec
-            Rayfield:Notify({Title = "Imported", Content = "Recording loaded", Duration = 3})
-        else
-            Rayfield:Notify({Title = "Import Failed", Content = "Invalid JSON: "..tostring(dec), Duration = 3})
-        end
-    end
-})
+end
 
 -- Initialize recordings and load configuration
 ensureFolder()
-filesDropdown:Refresh(listRecordings())
-Rayfield:LoadConfiguration()
+if filesDropdown and filesDropdown.Refresh then
+    filesDropdown:Refresh(listRecordings())
+end
+if Rayfield.LoadConfiguration then
+    Rayfield:LoadConfiguration()
+else
+    print("Cannot load configuration: LoadConfiguration is nil")
+end
 
--- Debugging: Log UI initialization complete
-print("Rayfield UI initialized successfully")
-
+-- Background tasks
 task.spawn(function()
     while true do
         if autoVote and PlaceDifficultyVote and PlaceDifficultyVote.InvokeServer then
