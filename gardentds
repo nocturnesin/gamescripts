@@ -1,0 +1,598 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+
+local RemoteFunctions = ReplicatedStorage:FindFirstChild("RemoteFunctions") or ReplicatedStorage
+local PlaceUnit = RemoteFunctions:FindFirstChild("PlaceUnit")
+local SellUnit = RemoteFunctions:FindFirstChild("SellUnit")
+local PlaceDifficultyVote = RemoteFunctions:FindFirstChild("PlaceDifficultyVote")
+local StartDifficultyVote = (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("StartDifficultyVote")) or ReplicatedStorage:FindFirstChild("StartDifficultyVote")
+local SetUnitEquipped = RemoteFunctions:FindFirstChild("SetUnitEquipped")
+
+local recordingsFolder = "recordings"
+local recording = false
+local currentRecording = {}
+local replaying = false
+local replayThread
+local replayOptions = {Speed = 1, Loop = false, StartWaveOffset = 0}
+local autoVote = false
+local autoVoteChoice = "dif_normal"
+local waveCache = {Current = 0, Max = 0}
+
+-- Filesystem compatibility
+local filesystem = {
+    makeFolder = makefolder or (isfolder and function(name) if not isfolder(name) then return false end return true end) or function() return false end,
+    isFolder = isfolder or function() return false end,
+    listFiles = listfiles or function() return {} end,
+    writeFile = writefile or function() return false end,
+    readFile = readfile or function() return nil end
+}
+
+local function ensureFolder()
+    if not filesystem.isFolder(recordingsFolder) then
+        local success = filesystem.makeFolder(recordingsFolder)
+        if not success then warn("Failed to create folder: "..recordingsFolder) end
+        return success
+    end
+    return true
+end
+
+local function listRecordings()
+    local out = {}
+    local ok, files = pcall(filesystem.listFiles, recordingsFolder)
+    if ok and type(files) == "table" then
+        for _, f in ipairs(files) do
+            local nm = f:match(recordingsFolder.."[/\\](.+)%.json$") or f:match("(.+)%.json$")
+            if nm then table.insert(out, nm) end
+        end
+    else
+        warn("Failed to list recordings: "..tostring(files))
+    end
+    return out
+end
+
+local function saveRecording(name, data)
+    if not ensureFolder() then return false, "Failed to create folder" end
+    local fname = recordingsFolder.."/"..name..".json"
+    local ok, enc = pcall(HttpService.JSONEncode, HttpService, data)
+    if not ok then return false, "JSON encode failed: "..tostring(enc) end
+    local suc, err = pcall(filesystem.writeFile, fname, enc)
+    if suc then return true end
+    return false, "Write failed: "..tostring(err)
+end
+
+local function loadRecording(name)
+    if not filesystem.readFile then return nil, "readFile not available" end
+    local fname = recordingsFolder.."/"..name..".json"
+    local ok, content = pcall(filesystem.readFile, fname)
+    if not ok then return nil, "Read failed: "..tostring(content) end
+    local ok2, dec = pcall(HttpService.JSONDecode, HttpService, content)
+    if not ok2 then return nil, "JSON decode failed: "..tostring(dec) end
+    return dec
+end
+
+local function getWaveText()
+    local ok, txt = pcall(function()
+        local gui = PlayerGui:FindFirstChild("GameGuiNoInset") or PlayerGui:FindFirstChild("GameGui")
+        if not gui then return nil, "No GameGui found" end
+        local screen = gui:FindFirstChild("Screen") or gui
+        local top = screen:FindFirstChild("Top") or screen
+        local info = top:FindFirstChild("GameInfo") or top
+        local content = info:FindFirstChild("Content") or info
+        local waves = content:FindFirstChild("Waves")
+        if not waves then return nil, "No Waves GUI found" end
+        local title = waves:FindFirstChild("Title")
+        if not title then return nil, "No Title found" end
+        return title.Text
+    end)
+    if not ok then return nil, "Error accessing GUI: "..tostring(txt) end
+    return txt
+end
+
+local function updateWaveCache()
+    local txt, err = getWaveText()
+    if not txt then
+        warn("Failed to update wave cache: "..tostring(err))
+        return
+    end
+    local a, b = string.match(txt, "Wave%s*(%d+)%s*/%s*(%d+)")
+    if a and b then
+        waveCache.Current = tonumber(a) or 0
+        waveCache.Max = tonumber(b) or 0
+        return
+    end
+    local n = string.match(txt, "Wave%s*(%d+)")
+    if n then
+        waveCache.Current = tonumber(n) or 0
+        return
+    end
+    local v = string.match(txt, "(%d+)%s*/%s*%d+")
+    if v then
+        waveCache.Current = tonumber(v) or 0
+    end
+end
+
+local function recordAction(t)
+    if not recording then return end
+    table.insert(currentRecording, t)
+end
+
+local function safeCloneArgs(args)
+    local out = {}
+    for i, v in ipairs(args) do
+        if typeof(v) == "CFrame" then
+            out[i] = {__type="CFrame", Value = {v:components()}}
+        elseif typeof(v) == "Vector3" then
+            out[i] = {__type="Vector3", Value = {v.X, v.Y, v.Z}}
+        elseif typeof(v) == "Instance" then
+            out[i] = {__type="Instance", Value = v:GetFullName()}
+        else
+            out[i] = v
+        end
+    end
+    return out
+end
+
+local function restoreArg(v)
+    if type(v) == "table" and v.__type == "CFrame" and v.Value then
+        local c = v.Value
+        return CFrame.new(c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12])
+    elseif type(v) == "table" and v.__type == "Vector3" and v.Value then
+        local c = v.Value
+        return Vector3.new(c[1], c[2], c[3])
+    else
+        return v
+    end
+end
+
+local hookAvailable = type(hookmetamethod) == "function" and type(getnamecallmethod) == "function"
+local oldHook
+if hookAvailable then
+    oldHook = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        if method == "InvokeServer" then
+            if self == PlaceUnit then
+                local args = {...}
+                local copy = safeCloneArgs(args)
+                recordAction({Type="Place", Args=copy, Wave=waveCache.Current, Time=os.time()})
+            elseif self == SellUnit then
+                local args = {...}
+                local copy = safeCloneArgs(args)
+                recordAction({Type="Sell", Args=copy, Wave=waveCache.Current, Time=os.time()})
+            elseif self == PlaceDifficultyVote then
+                local args = {...}
+                local copy = safeCloneArgs(args)
+                recordAction({Type="PlaceDifficultyVote", Args=copy, Wave=waveCache.Current, Time=os.time()})
+            end
+        end
+        return oldHook(self, ...)
+    end)
+else
+    local function hookInvoke(remote, orig)
+        if not remote or not orig then return end
+        remote.InvokeServer = function(self, ...)
+            local args = {...}
+            local copy = safeCloneArgs(args)
+            local t = remote == PlaceUnit and "Place" or remote == SellUnit and "Sell" or "PlaceDifficultyVote"
+            recordAction({Type=t, Args=copy, Wave=waveCache.Current, Time=os.time()})
+            return orig(self, ...)
+        end
+    end
+    if PlaceUnit and PlaceUnit.InvokeServer then hookInvoke(PlaceUnit, PlaceUnit.InvokeServer) end
+    if SellUnit and SellUnit.InvokeServer then hookInvoke(SellUnit, SellUnit.InvokeServer) end
+    if PlaceDifficultyVote and PlaceDifficultyVote.InvokeServer then hookInvoke(PlaceDifficultyVote, PlaceDifficultyVote.InvokeServer) end
+end
+
+local function playEntry(entry)
+    if not entry or not entry.Type then return end
+    local args = {}
+    for i, v in ipairs(entry.Args or {}) do args[i] = restoreArg(v) end
+    local ok, err = pcall(function()
+        if entry.Type == "Place" and PlaceUnit then
+            PlaceUnit:InvokeServer(unpack(args))
+        elseif entry.Type == "Sell" and SellUnit then
+            SellUnit:InvokeServer(unpack(args))
+        elseif entry.Type == "PlaceDifficultyVote" and PlaceDifficultyVote then
+            PlaceDifficultyVote:InvokeServer(unpack(args))
+        end
+    end)
+    if not ok then warn("Failed to play entry: "..tostring(err)) end
+end
+
+local function startReplay(data, options)
+    if replaying then return false, "Replay already in progress" end
+    if not data or #data == 0 then return false, "No data to replay" end
+    replaying = true
+    options = options or {}
+    replayOptions.Speed = math.clamp(options.Speed or replayOptions.Speed, 0.2, 4)
+    replayOptions.Loop = options.Loop or replayOptions.Loop
+    replayOptions.StartWaveOffset = math.max(0, options.StartWaveOffset or replayOptions.StartWaveOffset)
+    replayThread = coroutine.create(function()
+        while replaying do
+            local idx = 1
+            while replaying and idx <= #data do
+                local entry = data[idx]
+                local targetWave = (entry.Wave or 0) + replayOptions.StartWaveOffset
+                updateWaveCache()
+                local cur = waveCache.Current or 0
+                if cur >= targetWave then
+                    playEntry(entry)
+                    idx = idx + 1
+                    for _ = 1, math.max(1, math.floor(6/replayOptions.Speed)) do
+                        if not replaying then break end
+                        task.wait(0.05)
+                    end
+                else
+                    task.wait(0.2)
+                end
+            end
+            if not replayOptions.Loop then break end
+        end
+        replaying = false
+        replayThread = nil
+    end)
+    local ok, err = pcall(coroutine.resume, replayThread)
+    if not ok then
+        replaying = false
+        replayThread = nil
+        return false, "Replay failed: "..tostring(err)
+    end
+    return true
+end
+
+local function stopReplay()
+    replaying = false
+    if replayThread then
+        coroutine.close(replayThread)
+        replayThread = nil
+    end
+end
+
+local function scanHotbar()
+    local out = {}
+    local backpackGui = PlayerGui:FindFirstChild("BackpackGui") or PlayerGui:FindFirstChild("Backpack")
+    if not backpackGui then return out, "No BackpackGui found" end
+    local hotbar = backpackGui:FindFirstChild("Backpack") or backpackGui:FindFirstChild("Hotbar")
+    if not hotbar then return out, "No Hotbar found" end
+    for i = 1, 10 do
+        local btn = hotbar:FindFirstChild(tostring(i)) or hotbar:FindFirstChild("Button"..i)
+        if btn then
+            local txt = btn:FindFirstChild("ToolName")
+            if txt and (txt:IsA("TextBox") or txt:IsA("TextLabel")) then
+                table.insert(out, {Index=i, Name=txt.Text})
+            end
+        end
+    end
+    return out
+end
+
+local function scanUnits()
+    local UnitsFolder = ReplicatedStorage:FindFirstChild("Models") and ReplicatedStorage.Models:FindFirstChild("Units") or ReplicatedStorage:FindFirstChild("Units")
+    local out = {}
+    if not UnitsFolder then return out, "No Units folder found" end
+    for _, v in ipairs(UnitsFolder:GetChildren()) do
+        table.insert(out, v.Name)
+    end
+    return out
+end
+
+-- Load Rayfield library
+local Rayfield
+local ok, err = pcall(function()
+    Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+end)
+if not ok or not Rayfield then
+    warn("Failed to load Rayfield: "..tostring(err))
+    Rayfield = {
+        CreateWindow = function() return {
+            CreateTab = function() return {
+                CreateSection = function() end,
+                CreateButton = function() end,
+                CreateInput = function() return {Value = ""} end,
+                CreateDropdown = function() return {Value = "", Refresh = function() end} end,
+                CreateSlider = function() end,
+                CreateToggle = function() end
+            } end
+        },
+        Notify = function(args) warn(args.Title..": "..args.Content) end,
+        LoadConfiguration = function() end
+    }
+end
+
+-- Debugging: Log UI initialization
+print("Initializing Rayfield UI...")
+
+local Window = Rayfield:CreateWindow({
+    Name = "Recorder",
+    LoadingTitle = "Recorder",
+    LoadingSubtitle = "Ready",
+    ConfigurationSaving = {Enabled = true, FolderName = nil, FileName = "recorder_config"},
+    ToggleUIKeybind = "K" -- Added keybind to toggle UI visibility
+})
+
+-- Recorder Tab
+local recTab = Window:CreateTab("Recorder")
+local recSection = recTab:CreateSection("Record Controls")
+recTab:CreateButton({
+    Name = "Start Recording",
+    Callback = function()
+        currentRecording = {}
+        recording = true
+        Rayfield:Notify({Title = "Recording", Content = "Started recording", Duration = 3})
+    end
+})
+recTab:CreateButton({
+    Name = "Stop Recording",
+    Callback = function()
+        recording = false
+        Rayfield:Notify({Title = "Recording", Content = "Stopped recording", Duration = 3})
+    end
+})
+local saveNameInput = recTab:CreateInput({
+    Name = "Filename",
+    PlaceholderText = "session_name",
+    RemoveTextAfterFocus = false,
+    Callback = function() end
+})
+recTab:CreateButton({
+    Name = "Save",
+    Callback = function()
+        local name = tostring(saveNameInput.Value ~= "" and saveNameInput.Value or ("rec_"..os.time()))
+        local ok, e = saveRecording(name, currentRecording)
+        Rayfield:Notify({Title = ok and "Saved" or "Save Failed", Content = ok and name or tostring(e), Duration = 4})
+    end
+})
+
+local recViewSection = recTab:CreateSection("Live")
+recTab:CreateButton({
+    Name = "Show Current Length",
+    Callback = function()
+        Rayfield:Notify({Title = "Recording", Content = tostring(#currentRecording).." actions", Duration = 3})
+    end
+})
+recTab:CreateButton({
+    Name = "Clear Current",
+    Callback = function()
+        currentRecording = {}
+        Rayfield:Notify({Title = "Cleared", Content = "Current recording cleared", Duration = 3})
+    end
+})
+
+-- Replayer Tab
+local replayTab = Window:CreateTab("Replayer")
+local replaySection = replayTab:CreateSection("Files & Playback")
+local files = listRecordings()
+local filesDropdown = replayTab:CreateDropdown({
+    Name = "Recordings",
+    Options = files,
+    MultiSelection = false,
+    Callback = function() end
+})
+replayTab:CreateButton({
+    Name = "Refresh",
+    Callback = function()
+        local newFiles = listRecordings()
+        filesDropdown:Refresh(newFiles)
+        Rayfield:Notify({Title = "Refreshed", Content = "Loaded "..#newFiles.." recordings", Duration = 3})
+    end
+})
+replayTab:CreateButton({
+    Name = "Load Selected",
+    Callback = function()
+        local sel = filesDropdown.Value
+        if type(sel) == "table" then sel = sel[1] end
+        if not sel or sel == "" then
+            Rayfield:Notify({Title = "No File", Content = "Select a file to load", Duration = 3})
+            return
+        end
+        local data, e = loadRecording(sel)
+        if data then
+            currentRecording = data
+            Rayfield:Notify({Title = "Loaded", Content = sel, Duration = 3})
+        else
+            Rayfield:Notify({Title = "Load Failed", Content = tostring(e), Duration = 4})
+        end
+    end
+})
+replayTab:CreateButton({
+    Name = "Start Replay",
+    Callback = function()
+        if #currentRecording == 0 then
+            Rayfield:Notify({Title = "No Data", Content = "Load or record first", Duration = 3})
+            return
+        end
+        local ok, err = startReplay(currentRecording, {Speed = replayOptions.Speed, Loop = replayOptions.Loop, StartWaveOffset = replayOptions.StartWaveOffset})
+        Rayfield:Notify({Title = ok and "Replay Started" or "Replay Failed", Content = ok and "Playing "..#currentRecording.." actions" or tostring(err), Duration = 4})
+    end
+})
+replayTab:CreateButton({
+    Name = "Stop Replay",
+    Callback = function()
+        stopReplay()
+        Rayfield:Notify({Title = "Stopped", Content = "Replay stopped", Duration = 3})
+    end
+})
+replayTab:CreateSlider({
+    Name = "Speed",
+    Range = {0.2, 4},
+    Increment = 0.1,
+    Suffix = "x",
+    CurrentValue = 1,
+    Callback = function(v)
+        replayOptions.Speed = v
+    end
+})
+replayTab:CreateToggle({
+    Name = "Loop",
+    CurrentValue = false,
+    Callback = function(v)
+        replayOptions.Loop = v
+    end
+})
+replayTab:CreateInput({
+    Name = "Start Wave Offset",
+    PlaceholderText = "0",
+    RemoveTextAfterFocus = false,
+    Callback = function(v)
+        replayOptions.StartWaveOffset = tonumber(v) or 0
+    end
+})
+
+-- Tools Tab
+local toolsTab = Window:CreateTab("Tools")
+local toolsSection = toolsTab:CreateSection("Scans & Vote")
+toolsTab:CreateButton({
+    Name = "Scan Hotbar",
+    Callback = function()
+        local h, err = scanHotbar()
+        local s = ""
+        for _, v in ipairs(h) do s = s..v.Index..": "..(v.Name or "nil").."\n" end
+        Rayfield:Notify({Title = "Hotbar", Content = s ~= "" and s or (err or "Empty hotbar"), Duration = 6})
+    end
+})
+toolsTab:CreateButton({
+    Name = "Scan Units Folder",
+    Callback = function()
+        local u, err = scanUnits()
+        Rayfield:Notify({Title = "Units", Content = u and ("Found "..#u.." units") or (err or "No units found"), Duration = 4})
+    end
+})
+toolsTab:CreateToggle({
+    Name = "Auto Vote",
+    CurrentValue = false,
+    Callback = function(v)
+        autoVote = v
+    end
+})
+toolsTab:CreateDropdown({
+    Name = "Difficulty",
+    Options = {"dif_normal", "dif_hard", "dif_insane"},
+    MultiSelection = false,
+    Callback = function(v)
+        autoVoteChoice = type(v) == "table" and v[1] or v
+    end
+})
+toolsTab:CreateButton({
+    Name = "Send Vote Now",
+    Callback = function()
+        if not PlaceDifficultyVote or not PlaceDifficultyVote.InvokeServer then
+            Rayfield:Notify({Title = "Vote Failed", Content = "PlaceDifficultyVote unavailable", Duration = 3})
+            return
+        end
+        local diff = autoVoteChoice or "dif_normal"
+        local ok, err = pcall(PlaceDifficultyVote.InvokeServer, PlaceDifficultyVote, diff)
+        Rayfield:Notify({Title = ok and "Vote Sent" or "Vote Failed", Content = ok and ("Voted for "..diff) or tostring(err), Duration = 3})
+    end
+})
+
+-- Lobby Tab
+local lobbyTab = Window:CreateTab("Lobby")
+local lobbySection = lobbyTab:CreateSection("Unit Equipment")
+local unitInput = lobbyTab:CreateInput({
+    Name = "Unit Name",
+    PlaceholderText = "e.g., unique_1",
+    RemoveTextAfterFocus = false,
+    Callback = function() end
+})
+lobbyTab:CreateButton({
+    Name = "Equip Unit",
+    Callback = function()
+        if not SetUnitEquipped or not SetUnitEquipped.InvokeServer then
+            Rayfield:Notify({Title = "Equip Failed", Content = "SetUnitEquipped remote unavailable", Duration = 3})
+            return
+        end
+        local unitName = unitInput.Value
+        if not unitName or unitName == "" then
+            Rayfield:Notify({Title = "Equip Failed", Content = "Enter a unit name", Duration = 3})
+            return
+        end
+        local ok, err = pcall(SetUnitEquipped.InvokeServer, SetUnitEquipped, unitName, true)
+        Rayfield:Notify({Title = ok and "Equipped" or "Equip Failed", Content = ok and ("Equipped "..unitName) or tostring(err), Duration = 3})
+    end
+})
+lobbyTab:CreateButton({
+    Name = "Unequip Unit",
+    Callback = function()
+        if not SetUnitEquipped or not SetUnitEquipped.InvokeServer then
+            Rayfield:Notify({Title = "Unequip Failed", Content = "SetUnitEquipped remote unavailable", Duration = 3})
+            return
+        end
+        local unitName = unitInput.Value
+        if not unitName or unitName == "" then
+            Rayfield:Notify({Title = "Unequip Failed", Content = "Enter a unit name", Duration = 3})
+            return
+        end
+        local ok, err = pcall(SetUnitEquipped.InvokeServer, SetUnitEquipped, unitName, false)
+        Rayfield:Notify({Title = ok and "Unequipped" or "Unequip Failed", Content = ok and ("Unequipped "..unitName) or tostring(err), Duration = 3})
+    end
+})
+
+-- Misc Tab
+local miscTab = Window:CreateTab("Misc")
+local miscSection = miscTab:CreateSection("Options")
+miscTab:CreateButton({
+    Name = "Current Wave",
+    Callback = function()
+        updateWaveCache()
+        Rayfield:Notify({Title = "Wave", Content = tostring(waveCache.Current).."/"..tostring(waveCache.Max), Duration = 3})
+    end
+})
+miscTab:CreateButton({
+    Name = "Export Current (clipboard)",
+    Callback = function()
+        local ok, enc = pcall(HttpService.JSONEncode, HttpService, currentRecording)
+        if ok and setclipboard then
+            setclipboard(enc)
+            Rayfield:Notify({Title = "Exported", Content = "Copied to clipboard", Duration = 3})
+        else
+            Rayfield:Notify({Title = "Export Failed", Content = tostring(enc or "No setclipboard"), Duration = 3})
+        end
+    end
+})
+miscTab:CreateButton({
+    Name = "Import from Clipboard",
+    Callback = function()
+        if not getclipboard then
+            Rayfield:Notify({Title = "No Clipboard", Content = "getclipboard unavailable", Duration = 3})
+            return
+        end
+        local str = getclipboard()
+        local ok, dec = pcall(HttpService.JSONDecode, HttpService, str)
+        if ok and type(dec) == "table" then
+            currentRecording = dec
+            Rayfield:Notify({Title = "Imported", Content = "Recording loaded", Duration = 3})
+        else
+            Rayfield:Notify({Title = "Import Failed", Content = "Invalid JSON: "..tostring(dec), Duration = 3})
+        end
+    end
+})
+
+-- Initialize recordings and load configuration
+ensureFolder()
+filesDropdown:Refresh(listRecordings())
+Rayfield:LoadConfiguration()
+
+-- Debugging: Log UI initialization complete
+print("Rayfield UI initialized successfully")
+
+task.spawn(function()
+    while true do
+        if autoVote and PlaceDifficultyVote and PlaceDifficultyVote.InvokeServer then
+            local ok, err = pcall(PlaceDifficultyVote.InvokeServer, PlaceDifficultyVote, autoVoteChoice)
+            if not ok then warn("Auto-vote failed: "..tostring(err)) end
+            task.wait(5)
+        else
+            task.wait(0.8)
+        end
+        updateWaveCache()
+    end
+end)
+
+RunService.Heartbeat:Connect(function()
+    if recording then
+        -- Live updates can be added here if needed
+    end
+end)
